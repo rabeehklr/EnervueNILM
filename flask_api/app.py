@@ -23,6 +23,13 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT', '5432')
 }
 
+# Dynamic limits dictionary (could be persisted in a database)
+dynamic_limits = {
+    'bulb': 65.0,
+    'laptop charger': 150.0,
+    'unknown': float('inf')
+}
+
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
@@ -41,16 +48,23 @@ def background_task():
         socketio.sleep(2)
 
 def check_anomaly(appliance_name, current_power):
-    normal_limits = {
-        'bulb': 65,
-        'laptop charger': 150,  # Standardized to 150W
-        'unknown': float('inf')
-    }
     appliance_name = appliance_name.lower()
-    limit = normal_limits.get(appliance_name, float('inf'))
+    limit = dynamic_limits.get(appliance_name, float('inf'))
     is_anomaly = current_power > limit
     logging.info(f"Anomaly check - {appliance_name}: current_power={current_power}, limit={limit}, is_anomaly={is_anomaly}")
     return is_anomaly
+
+# New endpoint to update anomaly limits
+@app.route('/api/update-limit', methods=['POST'])
+def update_limit():
+    data = request.json
+    appliance_name = data.get('appliance_name', '').lower()
+    new_limit = float(data.get('limit', float('inf')))
+    if appliance_name:
+        dynamic_limits[appliance_name] = new_limit
+        logging.info(f"Updated limit for {appliance_name} to {new_limit}")
+        return jsonify({'status': 'success', 'appliance_name': appliance_name, 'new_limit': new_limit})
+    return jsonify({'error': 'Invalid appliance name'}), 400
 
 def send_real_time_data():
     conn = get_db_connection()
@@ -93,15 +107,12 @@ def send_real_time_data():
             FROM predictions
             WHERE appliance_name = %s
             AND timestamp >= NOW() - INTERVAL '7 days'
-            AND appliance_power > CASE 
-                WHEN appliance_name = 'bulb' THEN 65
-                WHEN appliance_name = 'laptop charger' THEN 150
-                ELSE appliance_power
-            END
+            AND appliance_power > %s
             GROUP BY day
             ORDER BY day;
             """
-            cur.execute(query_anomalies, (appliance_name,))
+            limit = dynamic_limits.get(appliance_name.lower(), float('inf'))
+            cur.execute(query_anomalies, (appliance_name, limit))
             weekly_anomalies = [
                 {'day': row['day'].strftime('%a'), 'count': int(row['count'])}
                 for row in cur.fetchall()
@@ -263,13 +274,10 @@ def get_anomalies_count(appliance_name):
         FROM predictions
         WHERE appliance_name = %s
         AND timestamp >= CURRENT_DATE
-        AND appliance_power > CASE 
-            WHEN appliance_name = 'bulb' THEN 65
-            WHEN appliance_name = 'laptop charger' THEN 150
-            ELSE appliance_power
-        END;
+        AND appliance_power > %s;
         """
-        cur.execute(query, (appliance_name,))
+        limit = dynamic_limits.get(appliance_name.lower(), float('inf'))
+        cur.execute(query, (appliance_name, limit))
         result = cur.fetchone()
         return int(result[0]) if result and result[0] else 0
     finally:

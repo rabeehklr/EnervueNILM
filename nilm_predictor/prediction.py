@@ -65,9 +65,10 @@ class NILMModelPredictor:
         self.last_processed_timestamp = None
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.status_threshold = 0.5
+        self.status_threshold = 0.5  # Lowered to 0.5 to catch bulb more reliably
         self.min_power_threshold = 5
         self.time_steps = 10
+        self.mobile_charger_threshold = 25.0
         self.load_model(model_path)
     
     def wait_for_database(self):
@@ -98,6 +99,13 @@ class NILMModelPredictor:
             self.model.eval()
             logging.info("Model loaded successfully")
             logging.info(f"Appliances: {self.appliances}")
+            if 'mobile charger' not in self.appliances or 'bulb' not in self.appliances or 'laptop charger' not in self.appliances:
+                missing = [a for a in ['mobile charger', 'bulb', 'laptop charger'] if a not in self.appliances]
+                logging.error(f"Missing appliances in model: {missing}")
+                raise ValueError("Required appliances not found in model")
+            self.mobile_charger_idx = self.appliances.index('mobile charger')
+            self.bulb_idx = self.appliances.index('bulb')
+            self.laptop_charger_idx = self.appliances.index('laptop charger')
         except Exception as e:
             logging.error(f"Error loading model: {str(e)}")
             raise
@@ -107,20 +115,54 @@ class NILMModelPredictor:
             padding = np.zeros((self.time_steps - len(features), features.shape[1]))
             features = np.vstack((padding, features))
         elif len(features) > self.time_steps:
-            features = features[-self.time_steps:]  # Take last time_steps
+            features = features[-self.time_steps:]
         features_normalized = self.scaler.transform(features)
         features_tensor = torch.FloatTensor(features_normalized).to(self.device)
-        features_tensor = features_tensor.T.unsqueeze(0)  # [1, features, time_steps]
+        features_tensor = features_tensor.T.unsqueeze(0)
         return features_tensor
     
     def adjust_predictions(self, status_preds, power_preds, total_power):
-        status = (status_preds.cpu().numpy() > self.status_threshold).astype(int).tolist()  # Convert to Python int list
-        power = power_preds.cpu().numpy()
-        adjusted_power = power * status
-        predicted_total = np.sum(adjusted_power)
-        if predicted_total > 0 and total_power > self.min_power_threshold:
-            ratio = total_power / predicted_total
-            adjusted_power *= ratio
+        status_preds_np = status_preds.cpu().numpy()
+        power_preds_np = power_preds.cpu().numpy()
+        
+        # Log raw predictions for debugging
+        logging.debug(f"Raw status_preds: {dict(zip(self.appliances, status_preds_np))}, "
+                      f"power_preds: {dict(zip(self.appliances, power_preds_np))}, "
+                      f"total_power: {total_power}")
+
+        # Initialize status and power arrays
+        status = np.zeros(len(self.appliances), dtype=int).tolist()
+        adjusted_power = np.zeros(len(self.appliances))
+
+        if total_power < self.mobile_charger_threshold:
+            # Exclusive mobile charger case
+            status[self.mobile_charger_idx] = 1
+            adjusted_power[self.mobile_charger_idx] = min(total_power, power_preds_np[self.mobile_charger_idx])
+            
+        else:
+            # Predict other appliances (excluding mobile charger)
+            status = (status_preds_np > self.status_threshold).astype(int).tolist()
+            status[self.mobile_charger_idx] = 0  # Force mobile charger off
+            adjusted_power = power_preds_np * np.array(status)
+            predicted_total = np.sum(adjusted_power)
+
+            # If no appliances are predicted but power is significant, lower threshold for top candidates
+            if predicted_total == 0 and total_power > self.min_power_threshold:
+                top_indices = np.argsort(status_preds_np)[-2:]  # Take top 2 appliances
+                for idx in top_indices:
+                    if idx != self.mobile_charger_idx and status_preds_np[idx] > 0.3:  # Relaxed threshold
+                        status[idx] = 1
+                        adjusted_power[idx] = power_preds_np[idx]
+                predicted_total = np.sum(adjusted_power)
+
+            # Scale power to match total_power
+            if predicted_total > 0 and total_power > self.min_power_threshold:
+                ratio = total_power / predicted_total
+                adjusted_power *= ratio
+        
+        # Log adjusted predictions
+        logging.debug(f"Adjusted status: {dict(zip(self.appliances, status))}, "
+                      f"power: {dict(zip(self.appliances, adjusted_power))}")
         return status, adjusted_power
 
     @contextmanager
@@ -134,16 +176,15 @@ class NILMModelPredictor:
     def predict_and_store(self, target_latency=2.0):
         logging.info("Starting prediction loop with target latency of 2 seconds per row")
         
-        # Persistent connection
         with self.database_connection() as conn:
             cur = conn.cursor()
             last_log_time = time.time()
+            last_total_power = None
             
             while True:
                 try:
                     start_time = time.time()
                     
-                    # Fetch one row at a time
                     query = """
                     SELECT timestamp, voltage, current, active_power
                     FROM aggregate_data
@@ -155,32 +196,36 @@ class NILMModelPredictor:
                     row = cur.fetchone()
                     
                     if not row:
-                        # Minimal delay only if no data, check frequently
-                        if time.time() - last_log_time > 10:  # Log every 10s
+                        if time.time() - last_log_time > 10:
                             logging.info("No new data, checking again soon")
                             last_log_time = time.time()
-                        time.sleep(0.1)  # Short polling interval
+                        time.sleep(0.1)
                         continue
                     
-                    # Process single row
                     input_data = pd.DataFrame([row], columns=['timestamp', 'voltage', 'current', 'active_power'])
                     self.last_processed_timestamp = input_data['timestamp'].iloc[0]
                     features = input_data[['voltage', 'current', 'active_power']].values
+                    total_power = input_data['active_power'].iloc[0]
                     
-                    # Maintain a rolling window of features for sequence
+                    # Reset buffer on significant power drop
+                    if last_total_power is not None and total_power < last_total_power * 0.1:
+                        logging.info("Significant power drop detected, resetting feature buffer")
+                        self.feature_buffer = np.zeros((self.time_steps, 3))
+                    last_total_power = total_power
+                    
+                    # Update feature buffer
                     if not hasattr(self, 'feature_buffer'):
-                        self.feature_buffer = np.zeros((self.time_steps, 3))  # [time_steps, features]
-                    self.feature_buffer[:-1] = self.feature_buffer[1:]  # Shift left
-                    self.feature_buffer[-1] = features[0]  # Add new row
+                        self.feature_buffer = np.zeros((self.time_steps, 3))
+                    self.feature_buffer[:-1] = self.feature_buffer[1:]
+                    self.feature_buffer[-1] = features[0]
                     
                     X = self.prepare_batch(self.feature_buffer)
                     with torch.no_grad():
                         status_preds, power_preds = self.model(X)
                     
-                    total_power = input_data['active_power'].iloc[0]
                     status, adjusted_power = self.adjust_predictions(status_preds[0], power_preds[0], total_power)
                     
-                    # Store predictions for this row
+                    # Store predictions
                     for j, appliance in enumerate(self.appliances):
                         cur.execute("""
                         INSERT INTO predictions 
@@ -195,23 +240,21 @@ class NILMModelPredictor:
                     
                     conn.commit()
                     
-                    # Measure and enforce latency
                     elapsed_time = time.time() - start_time
                     if elapsed_time > target_latency:
                         logging.warning(f"Processing took {elapsed_time:.2f}s, exceeding target of {target_latency}s")
-                    elif time.time() - last_log_time > 10:  # Log progress every 10s
+                    elif time.time() - last_log_time > 10:
                         logging.info(f"Processed row at {input_data['timestamp'].iloc[0]}, took {elapsed_time:.2f}s")
                         last_log_time = time.time()
                     
-                    # If we're under 2s, no need to sleep; proceed immediately
                     remaining_time = target_latency - elapsed_time
                     if remaining_time > 0:
-                        time.sleep(min(remaining_time, 0.1))  # Small sleep to avoid busy-waiting
+                        time.sleep(min(remaining_time, 0.1))
                     
                 except Exception as e:
                     logging.error(f"Error: {str(e)}")
                     conn.rollback()
-                    time.sleep(0.5)  # Short retry delay on error
+                    time.sleep(0.5)
 
 def main():
     db_params = {
