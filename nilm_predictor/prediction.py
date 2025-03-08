@@ -11,7 +11,7 @@ from contextlib import contextmanager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 class CNNLSTMModel(nn.Module):
-    def __init__(self, input_features=3, time_steps=10, num_appliances=6):
+    def __init__(self, input_features=3, time_steps=5, num_appliances=6):  # Reduced time_steps to 5
         super().__init__()
         self.time_steps = time_steps
         self.cnn = nn.Sequential(
@@ -65,10 +65,10 @@ class NILMModelPredictor:
         self.last_processed_timestamp = None
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.status_threshold = 0.5  # Lowered to 0.5 to catch bulb more reliably
+        self.status_threshold = 0.5 # Lowered from 0.8 to 0.6
         self.min_power_threshold = 5
-        self.time_steps = 10
-        self.mobile_charger_threshold = 25.0
+        self.time_steps = 5  # Reduced from 10 to 5 to reduce lag
+        self.mobile_charger_threshold = 35.0
         self.load_model(model_path)
     
     def wait_for_database(self):
@@ -126,23 +126,35 @@ class NILMModelPredictor:
         power_preds_np = power_preds.cpu().numpy()
         
         # Log raw predictions for debugging
-        logging.debug(f"Raw status_preds: {dict(zip(self.appliances, status_preds_np))}, "
-                      f"power_preds: {dict(zip(self.appliances, power_preds_np))}, "
-                      f"total_power: {total_power}")
+        logging.info(f"Timestamp: {time.time()}, Total power: {total_power}, "
+                     f"Bulb status_pred: {status_preds_np[self.bulb_idx]:.3f}, "
+                     f"Laptop charger status_pred: {status_preds_np[self.laptop_charger_idx]:.3f}, "
+                     f"Bulb power_pred: {power_preds_np[self.bulb_idx]:.3f}, "
+                     f"Laptop charger power_pred: {power_preds_np[self.laptop_charger_idx]:.3f}")
 
         # Initialize status and power arrays
         status = np.zeros(len(self.appliances), dtype=int).tolist()
         adjusted_power = np.zeros(len(self.appliances))
 
+        # Add explicit check for zero or very low power
+        if total_power <= self.min_power_threshold:
+            logging.info(f"Total power ({total_power}) below minimum threshold ({self.min_power_threshold}). All appliances predicted OFF.")
+            return status, adjusted_power
+            
         if total_power < self.mobile_charger_threshold:
             # Exclusive mobile charger case
             status[self.mobile_charger_idx] = 1
             adjusted_power[self.mobile_charger_idx] = min(total_power, power_preds_np[self.mobile_charger_idx])
-            
         else:
             # Predict other appliances (excluding mobile charger)
             status = (status_preds_np > self.status_threshold).astype(int).tolist()
             status[self.mobile_charger_idx] = 0  # Force mobile charger off
+
+            # Relaxed threshold for bulb if total_power suggests multiple appliances
+            if total_power > 100 and status[self.bulb_idx] == 0 and status_preds_np[self.bulb_idx] > 0.4:
+                status[self.bulb_idx] = 1
+                logging.info("Forced bulb on due to high total_power and status_pred > 0.4")
+
             adjusted_power = power_preds_np * np.array(status)
             predicted_total = np.sum(adjusted_power)
 
@@ -159,10 +171,13 @@ class NILMModelPredictor:
             if predicted_total > 0 and total_power > self.min_power_threshold:
                 ratio = total_power / predicted_total
                 adjusted_power *= ratio
+                # Enforce minimum power for bulb if on
+                if status[self.bulb_idx] == 1:
+                    adjusted_power[self.bulb_idx] = max(adjusted_power[self.bulb_idx], 50.0)  # Minimum bulb power
         
         # Log adjusted predictions
-        logging.debug(f"Adjusted status: {dict(zip(self.appliances, status))}, "
-                      f"power: {dict(zip(self.appliances, adjusted_power))}")
+        logging.info(f"Adjusted status: {dict(zip(self.appliances, status))}, "
+                     f"power: {dict(zip(self.appliances, adjusted_power))}")
         return status, adjusted_power
 
     @contextmanager
@@ -206,6 +221,12 @@ class NILMModelPredictor:
                     self.last_processed_timestamp = input_data['timestamp'].iloc[0]
                     features = input_data[['voltage', 'current', 'active_power']].values
                     total_power = input_data['active_power'].iloc[0]
+                    
+                    # Log raw input data
+                    logging.info(f"Raw input - Timestamp: {input_data['timestamp'].iloc[0]}, "
+                                 f"Voltage: {input_data['voltage'].iloc[0]}, "
+                                 f"Current: {input_data['current'].iloc[0]}, "
+                                 f"Active Power: {input_data['active_power'].iloc[0]}")
                     
                     # Reset buffer on significant power drop
                     if last_total_power is not None and total_power < last_total_power * 0.1:
